@@ -1,0 +1,207 @@
+# OE Data Intelligence Platform — Local Databricks-Equivalent Stack
+
+services:
+  spark-master:
+    image: apache/spark:3.5.3
+    container_name: oe-spark-master
+    hostname: spark-master
+    user: root
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    networks:
+      - oe-net
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+    entrypoint: /opt/spark/bin/spark-class
+    command: org.apache.spark.deploy.master.Master
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 30s
+
+  spark-worker-1:
+    image: apache/spark:3.5.3
+    container_name: oe-spark-worker-1
+    hostname: spark-worker-1
+    user: root
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - oe-net
+    entrypoint: /opt/spark/bin/spark-class
+    command: "org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+
+  # ── Spark Thrift Server ────────────────────────────────────────────
+  # Local equivalent of Databricks SQL Warehouse.
+  # Spring Boot connects: jdbc:hive2://localhost:10000/default
+  #
+  # FIX — DeltaCatalog ClassNotFoundException on session open:
+  # spark.jars.packages loads Delta onto the USER classloader only.
+  # The catalog plugin system uses the DRIVER system classloader.
+  # spark.driver.extraClassPath forces Delta onto BOTH classloaders
+  # so sessions can find DeltaCatalog when they open.
+  #
+  # The ivy-cache named volume persists downloaded JARs across
+  # container restarts — Ivy never re-downloads after first start.
+  #
+  # FIRST-START NOTE: on a fresh clone, run:
+  #   docker compose up -d
+  #   docker compose restart spark-thrift-server   <- one-time only
+  # This lets spark.jars.packages download the JARs on first start,
+  # then the restart makes them available on extraClassPath.
+  # All subsequent starts work automatically.
+  spark-thrift-server:
+    image: apache/spark:3.5.3
+    container_name: oe-spark-thrift
+    hostname: spark-thrift
+    user: root
+    ports:
+      - "10000:10000"
+      - "4041:4040"
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      # Persists Delta + hadoop-aws JARs so extraClassPath always
+      # finds them and Ivy never re-downloads them on restart
+      - ivy-cache:/root/.ivy2
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - oe-net
+    entrypoint: /opt/spark/bin/spark-submit
+    command: >
+      --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
+      --master local[2]
+      --name OE-ThriftServer
+      --hiveconf hive.server2.thrift.port=10000
+      --hiveconf hive.server2.thrift.bind.host=0.0.0.0
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      --conf spark.jars.packages=io.delta:delta-spark_2.12:3.2.0,org.apache.hadoop:hadoop-aws:3.3.4
+      --conf spark.driver.extraClassPath=/root/.ivy2/jars/io.delta_delta-spark_2.12-3.2.0.jar:/root/.ivy2/jars/io.delta_delta-storage-3.2.0.jar:/root/.ivy2/jars/org.antlr_antlr4-runtime-4.9.3.jar:/root/.ivy2/jars/org.apache.hadoop_hadoop-aws-3.3.4.jar:/root/.ivy2/jars/com.amazonaws_aws-java-sdk-bundle-1.12.262.jar
+      --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+      --conf spark.hadoop.fs.s3a.access.key=minioadmin
+      --conf spark.hadoop.fs.s3a.secret.key=minioadmin
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+      --conf spark.sql.shuffle.partitions=4
+      --conf spark.driver.memory=2g
+
+  jupyter:
+    image: jupyter/pyspark-notebook:spark-3.5.0
+    container_name: oe-jupyter
+    hostname: jupyter
+    user: root
+    environment:
+      - JUPYTER_TOKEN=databricks
+      - SPARK_MASTER=local
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_ENDPOINT_URL=http://minio:9000
+      - PYTHONPATH=/home/jovyan/project:/home/jovyan/project/src
+      - CHOWN_LIMITS=yes
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    volumes:
+      - .:/home/jovyan/project
+    working_dir: /home/jovyan/project
+    command: >
+      bash -c "
+      echo '==========================================================' &&
+      echo '  OE Platform — installing Python dependencies...' &&
+      echo '==========================================================' &&
+      pip install --no-cache-dir \
+        --trusted-host pypi.org \
+        --trusted-host pypi.python.org \
+        --trusted-host files.pythonhosted.org \
+        delta-spark==3.2.0 \
+        boto3==1.34.0 \
+        s3fs==2024.2.0 \
+        pyspark==3.5.0 &&
+      echo '  ✅ delta-spark, boto3, s3fs ready' &&
+      echo '==========================================================' &&
+      start.sh jupyter lab --notebook-dir=/home/jovyan/project
+      "
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - oe-net
+
+  # ── MinIO (S3-compatible object store) ─────────────────────────────
+  # MinIO, Inc. withdrew its community images from Docker Hub AND quay.io
+  # (anonymous pulls are denied for every tag). This uses an unofficial,
+  # unmodified third-party mirror of the official image.
+  # Swap for a registry you trust / an S3 alternative if preferred.
+  minio:
+    image: scnd/minio-mirror:RELEASE.2025-09-07T16-13-09Z
+    container_name: oe-minio
+    hostname: minio
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - oe-net
+    command: server /data --console-address ":9001"
+
+  # Bucket creation uses the AWS CLI (works against any S3 endpoint) so we
+  # no longer depend on the withdrawn minio/mc image. It retries until
+  # MinIO is accepting requests, so no MinIO healthcheck is needed.
+  minio-init:
+    image: amazon/aws-cli:latest
+    container_name: oe-minio-init
+    depends_on:
+      - minio
+    networks:
+      - oe-net
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_DEFAULT_REGION=us-east-1
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        until aws --endpoint-url http://minio:9000 s3 ls >/dev/null 2>&1; do
+          echo 'waiting for MinIO...'; sleep 2;
+        done
+        for b in bronze silver gold raw-logs; do
+          aws --endpoint-url http://minio:9000 s3api head-bucket --bucket $$b 2>/dev/null || aws --endpoint-url http://minio:9000 s3 mb s3://$$b
+        done
+        echo 'Buckets ready'
+
+volumes:
+  minio-data:
+    driver: local
+  # Persists Ivy JAR cache (Delta Lake, hadoop-aws, etc.) across
+  # container restarts — eliminates re-download on every docker compose up
+  ivy-cache:
+    driver: local
+
+networks:
+  oe-net:
+    driver: bridge
+    name: oe-intelligence-network
